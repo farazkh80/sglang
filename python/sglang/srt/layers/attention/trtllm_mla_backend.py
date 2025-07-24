@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
+from sglang.srt.layers.attention.flashinfer_mla_backend import (
+    FlashInferMLAAttnBackend,
+    FlashInferMLAMultiStepDraftBackend,
+)
 from sglang.srt.layers.attention.utils import (
     TRITON_PAD_NUM_PAGE_PER_BLOCK,
     create_flashmla_kv_indices_triton,
@@ -32,7 +35,11 @@ if TYPE_CHECKING:
 DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 
 # Block constraint from flashinfer requirements
-# See: https://github.com/flashinfer-ai/flashinfer/blob/fe29ed63cb923f25cae70ef83f3fd16139305b35/flashinfer/decode.py#L2057
+# From flashinfer.decode._check_trtllm_gen_mla_shape:
+#   block_num % (128 / block_size) == 0
+# This imposes that the total number of blocks must be divisible by
+# (128 / block_size). We capture the 128 constant here so we can
+# compute the LCM with other padding constraints.
 TRTLLM_BLOCK_CONSTRAINT = 128
 
 
@@ -104,7 +111,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Apply dual constraints (take LCM to satisfy both):
         # 1. TRT-LLM: block_num % (128 / page_size) == 0
-        #    Reference: https://github.com/NVIDIA/TensorRT-LLM/issues/XYZ  # TODO: add actual link
         # 2. Triton: page table builder uses 64-index bursts, needs multiple of 64
         trtllm_constraint = TRTLLM_BLOCK_CONSTRAINT // self.page_size
         constraint_lcm = math.lcm(trtllm_constraint, TRITON_PAD_NUM_PAGE_PER_BLOCK)
@@ -158,14 +164,38 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MLA."""
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
 
-        self.cuda_graph_kv_indices = torch.full(
-            (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
-        )
+        if kv_indices_buf is None:
+            # Regular backend: allocate based on blocks
+            max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+            self.max_blocks_per_seq = max_blocks_per_seq
+            total_blocks = max_bs * max_blocks_per_seq
+            self.cuda_graph_kv_indices = torch.full(
+                (total_blocks,), -1, dtype=torch.int32, device=self.device
+            )
+        else:
+            # Multi-step backend: use provided buffer
+            self.cuda_graph_kv_indices = kv_indices_buf
+            # Calculate blocks from buffer size
+            self.max_blocks_per_seq = kv_indices_buf.numel() // max_bs
+        
         self.cuda_graph_workspace = torch.empty(
             self.workspace_size, dtype=torch.int8, device=self.device
         )
+
+        self.cuda_graph_qo_indptr = self.q_indptr_decode.clone()
+        self.cuda_graph_kv_indptr = self.kv_indptr.clone()
+        self.cuda_graph_kv_lens = torch.ones(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
+
+        self.cuda_graph_qo_indptr_cpu = self.cuda_graph_qo_indptr.to("cpu")
+        self.cuda_graph_kv_indptr_cpu = self.cuda_graph_kv_indptr.to("cpu")
+        self.fast_decode_kwargs = {
+            "qo_indptr_cpu": self.cuda_graph_qo_indptr_cpu,
+            "kv_indptr_cpu": self.cuda_graph_kv_indptr_cpu,
+            "kv_indices": self.cuda_graph_kv_indices,
+        }
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -178,20 +208,31 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         spec_info: Optional[SpecInfo],
     ):
         """Initialize metadata for CUDA graph capture."""
-        if forward_mode.is_decode_or_idle() and spec_info is None:
+        # Decode/idle: ensure TRTLLMMLADecodeMetadata exists.
+        # Rebuild KV indices only when not in speculative mode.
+        if forward_mode.is_decode_or_idle():
             max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
-            block_kv_indices = self.cuda_graph_kv_indices[:bs, :max_seqlen_pad]
+            
+            # Calculate how many blocks we can use from the buffer
+            available_blocks = self.cuda_graph_kv_indices.numel() // bs
+            blocks_to_use = min(max_seqlen_pad, available_blocks)
+            
+            # Create 2D view for the kernel
+            flat_len = bs * blocks_to_use
+            block_kv_indices = self.cuda_graph_kv_indices[:flat_len].view(bs, blocks_to_use)
 
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                None,
-                block_kv_indices,
-                self.req_to_token.stride(0),
-                max_seqlen_pad,
-                self.page_size,
-            )
+            # Regenerate KV indices only for non-speculative path.
+            if spec_info is None:
+                create_flashmla_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    None,
+                    block_kv_indices,
+                    self.req_to_token.stride(0),
+                    blocks_to_use,
+                    self.page_size,
+                )
 
             metadata = TRTLLMMLADecodeMetadata(
                 self.cuda_graph_workspace, block_kv_indices
@@ -221,20 +262,37 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Replay CUDA graph with new inputs."""
-        if forward_mode.is_decode_or_idle() and spec_info is None:
+        # Replay: same rule, skip rebuild in speculative mode.
+        if forward_mode.is_decode_or_idle():
             metadata = self.decode_cuda_graph_metadata[bs]
 
             # Update block indices for new sequences
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                None,
-                metadata.block_kv_indices,
-                self.req_to_token.stride(0),
-                metadata.block_kv_indices.shape[1],
-                self.page_size,
-            )
+            max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
+            
+            # Calculate how many blocks we can use from the buffer
+            available_blocks = self.cuda_graph_kv_indices.numel() // bs
+            blocks_to_use = min(max_seqlen_pad, available_blocks)
+            
+            # Create 2D view for the kernel
+            flat_len = bs * blocks_to_use
+            kv_indices_view = self.cuda_graph_kv_indices[:flat_len].view(bs, blocks_to_use)
+
+            if spec_info is None:
+                create_flashmla_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices[:bs],
+                    seq_lens[:bs],
+                    None,
+                    kv_indices_view[
+                        :bs, : seq_lens.max().item() // self.page_size + 1
+                    ],
+                    self.req_to_token.stride(0),
+                    blocks_to_use,
+                    self.page_size,
+                )
+            
+            # Update metadata with the reshaped block indices
+            metadata.block_kv_indices = kv_indices_view
 
             self.forward_metadata = metadata
         else:
@@ -254,11 +312,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return 1
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Initialize the metadata for a forward pass."""
-        if (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is None
-        ):
+        """Initialize the metadata for a forward pass. """
+        if forward_batch.forward_mode.is_decode_or_idle():
             bs = forward_batch.batch_size
 
             # Get maximum sequence length
@@ -281,6 +336,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
         else:
+            # For prefill or other modes, fallback to parent implementation.
             super().init_forward_metadata(forward_batch)
 
     def forward_decode(
@@ -312,7 +368,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)  
+            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
         else:
             # q already has both parts
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -335,12 +391,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Scale computation for TRTLLM MLA kernel:
         # - BMM1 scale = q_scale * k_scale * softmax_scale
-        # - For FP16 path we keep q_scale = k_scale = 1.0, softmax_scale = 1/sqrt(head_dim) which is pre-computed as layer.scaling
-        # TODO: change once fp8 path is supported
-        q_scale = k_scale = 1.0 # for fp16 we keep 1 
-        bmm1_scale = q_scale * k_scale * layer.scaling 
+        # - For FP16 path we keep q_scale = 1.0, softmax_scale = 1/sqrt(head_dim) which is pre-computed as layer.scaling
+        # - k_scale is read from model checkpoint if available
+        # TODO: Change once fp8 path is supported
+        q_scale = 1.0  # for fp16 we keep q_scale as 1.0
 
-        # Call TRT-LLM kernel with proper scale configuration
+        # Read k_scale from model checkpoint
+        if layer.k_scale_float is not None:
+            k_scale = layer.k_scale_float
+            print(f"[TRTLLM MLA] Using k_scale_float from model checkpoint: {k_scale}")
+        else:
+            k_scale = 1.0
+            print(f"[TRTLLM MLA] No k_scale found in model checkpoint, using default: {k_scale}")
+
+        bmm1_scale = q_scale * k_scale * layer.scaling
+
+        # Block table should already be 2-D from metadata
+        block_tables = metadata.block_kv_indices
+        if block_tables.dim() != 2:
+            raise RuntimeError(
+                f"Expected 2-D block_kv_indices from metadata, got {block_tables.dim()}-D tensor"
+            )
+
+        # Call TRT-LLM kernel
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
@@ -348,9 +421,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=metadata.block_kv_indices,
+            block_tables=block_tables,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
-            max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
+            max_seq_len=int(block_tables.shape[1] * self.page_size),
             bmm1_scale=bmm1_scale
         )
 
@@ -359,3 +432,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         return output
+
+
+class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
+    """Multi-step draft backend for TRT-LLM MLA used by EAGLE."""
+
+    def __init__(self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int):
+        super().__init__(model_runner, topk, speculative_num_steps)
+
+        for i in range(self.speculative_num_steps):
+            self.attn_backends[i] = TRTLLMMLABackend(
+                model_runner,
+                skip_prefill=True,
+                kv_indptr_buf=self.kv_indptr[i],
+                # q_indptr buffer already shared by parent
+            )
