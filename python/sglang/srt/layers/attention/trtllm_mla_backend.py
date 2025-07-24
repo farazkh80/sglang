@@ -49,6 +49,8 @@ class TRTLLMMLADecodeMetadata:
 
     workspace: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
+    # Track buffer shape so replay can safely reuse the view
+    max_blocks_per_seq: Optional[int] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -59,11 +61,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
-        kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
-        )
+        super().__init__(model_runner, skip_prefill, kv_indptr_buf, q_indptr_decode_buf)
 
         config = model_runner.model_config
 
@@ -95,7 +95,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
         self.cuda_graph_kv_indices = None
-        self.forward_metadata: Union[TRTLLMMLADecodeMetadata] = None
+        self.forward_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -179,9 +179,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Calculate blocks from buffer size
             self.max_blocks_per_seq = kv_indices_buf.numel() // max_bs
         
-        self.cuda_graph_workspace = torch.empty(
-            self.workspace_size, dtype=torch.int8, device=self.device
-        )
+        # share the same workspace buffer between capture/replay
+        self.cuda_graph_workspace = self.workspace_buffer
 
         self.cuda_graph_qo_indptr = self.q_indptr_decode.clone()
         self.cuda_graph_kv_indptr = self.kv_indptr.clone()
@@ -212,30 +211,35 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Rebuild KV indices only when not in speculative mode.
         if forward_mode.is_decode_or_idle():
             max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
-            
-            # Calculate how many blocks we can use from the buffer
-            available_blocks = self.cuda_graph_kv_indices.numel() // bs
-            blocks_to_use = min(max_seqlen_pad, available_blocks)
-            
-            # Create 2D view for the kernel
-            flat_len = bs * blocks_to_use
-            block_kv_indices = self.cuda_graph_kv_indices[:flat_len].view(bs, blocks_to_use)
+            blocks_to_use = min(max_seqlen_pad, self.max_blocks_per_seq)
 
-            # Regenerate KV indices only for non-speculative path.
+            # Stable 2-D view covering the whole preallocated slice
+            flat_len = bs * self.max_blocks_per_seq
+            block_kv_indices_view = self.cuda_graph_kv_indices[:flat_len].view(
+                bs, self.max_blocks_per_seq
+            )
+
             if spec_info is None:
+                # Clear previously-filled columns that will not be overwritten this round
+                if blocks_to_use < self.max_blocks_per_seq:
+                    block_kv_indices_view[:, blocks_to_use:].fill_(-1)
+
+                # Fill only the columns we need this iteration
                 create_flashmla_kv_indices_triton[(bs,)](
                     self.req_to_token,
                     req_pool_indices,
                     seq_lens,
                     None,
-                    block_kv_indices,
+                    block_kv_indices_view[:, :blocks_to_use],
                     self.req_to_token.stride(0),
                     blocks_to_use,
                     self.page_size,
                 )
 
             metadata = TRTLLMMLADecodeMetadata(
-                self.cuda_graph_workspace, block_kv_indices
+                workspace=self.cuda_graph_workspace,
+                block_kv_indices=block_kv_indices_view[:bs],
+                max_blocks_per_seq=self.max_blocks_per_seq,
             )
             self.decode_cuda_graph_metadata[bs] = metadata
             self.forward_metadata = metadata
@@ -266,34 +270,31 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if forward_mode.is_decode_or_idle():
             metadata = self.decode_cuda_graph_metadata[bs]
 
-            # Update block indices for new sequences
             max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
-            
-            # Calculate how many blocks we can use from the buffer
-            available_blocks = self.cuda_graph_kv_indices.numel() // bs
-            blocks_to_use = min(max_seqlen_pad, available_blocks)
-            
-            # Create 2D view for the kernel
-            flat_len = bs * blocks_to_use
-            kv_indices_view = self.cuda_graph_kv_indices[:flat_len].view(bs, blocks_to_use)
+            blocks_to_use = min(max_seqlen_pad, metadata.max_blocks_per_seq)
+
+            flat_len = bs * metadata.max_blocks_per_seq
+            kv_indices_view = self.cuda_graph_kv_indices[:flat_len].view(
+                bs, metadata.max_blocks_per_seq
+            )
 
             if spec_info is None:
+                # Clear old indices beyond current blocks_to_use to avoid stale positives
+                if blocks_to_use < metadata.max_blocks_per_seq:
+                    kv_indices_view[:, blocks_to_use:].fill_(-1)
+
                 create_flashmla_kv_indices_triton[(bs,)](
                     self.req_to_token,
                     req_pool_indices[:bs],
                     seq_lens[:bs],
                     None,
-                    kv_indices_view[
-                        :bs, : seq_lens.max().item() // self.page_size + 1
-                    ],
+                    kv_indices_view[:, :blocks_to_use],
                     self.req_to_token.stride(0),
                     blocks_to_use,
                     self.page_size,
                 )
-            
-            # Update metadata with the reshaped block indices
-            metadata.block_kv_indices = kv_indices_view
 
+            metadata.block_kv_indices = kv_indices_view[:bs]
             self.forward_metadata = metadata
         else:
             super().init_forward_metadata_replay_cuda_graph(
@@ -396,13 +397,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # TODO: Change once fp8 path is supported
         q_scale = 1.0  # for fp16 we keep q_scale as 1.0
 
-        # Read k_scale from model checkpoint
-        if layer.k_scale_float is not None:
-            k_scale = layer.k_scale_float
-            print(f"[TRTLLM MLA] Using k_scale_float from model checkpoint: {k_scale}")
-        else:
-            k_scale = 1.0
-            print(f"[TRTLLM MLA] No k_scale found in model checkpoint, using default: {k_scale}")
+        # silently pick k_scale (avoid per-call prints in CUDA graph)
+        k_scale = layer.k_scale_float if getattr(layer, "k_scale_float", None) is not None else 1.0
 
         bmm1_scale = q_scale * k_scale * layer.scaling
 
@@ -445,5 +441,5 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 model_runner,
                 skip_prefill=True,
                 kv_indptr_buf=self.kv_indptr[i],
-                # q_indptr buffer already shared by parent
+                q_indptr_decode_buf=self.q_indptr_decode
             )
