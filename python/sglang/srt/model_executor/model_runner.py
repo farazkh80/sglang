@@ -369,7 +369,7 @@ class ModelRunner:
                 1.2 In other cases, we will use flashinfer if available, otherwise use triton.
             2. Models with MLA Architecture and using FA3
                 2.1 We will use FA3 backend on hopper.
-                2.2 We will use Flashinfer backend on blackwell.
+                2.2 We will use TRTLLM MLA backend on blackwell (except speculative decoding will use Flashinfer)
                 2.3 Otherwise, we will use triton backend.
             """
 
@@ -397,7 +397,23 @@ class ModelRunner:
                 ):
                     server_args.attention_backend = "fa3"
                 elif is_sm100_supported():
-                    server_args.attention_backend = "flashinfer"
+                    # Check if speculative decoding is enabled - TRTLLM MLA doesn't support it
+                    if server_args.speculative_algorithm is not None:
+                        logger.warning(
+                            f"TRTLLM MLA backend would be optimal for Blackwell but speculative_algorithm={server_args.speculative_algorithm} is not supported. "
+                            f"Falling back to flashinfer backend."
+                        )
+                        server_args.attention_backend = "flashinfer"
+                    else:
+                        server_args.attention_backend = "trtllm_mla"
+                        if server_args.page_size not in [32, 64]:
+                            logger.warning(
+                                f"TRTLLM MLA backend auto-selected but page_size={server_args.page_size} is not supported. "
+                                f"Changing page_size to 64."
+                            )
+                            server_args.page_size = 64
+                        # Ensure ModelRunner keeps the same page_size
+                        self.page_size = server_args.page_size
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number

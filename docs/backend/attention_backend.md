@@ -52,7 +52,7 @@ python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attenti
 python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attention-backend flashmla --kv-cache-dtype fp8_e4m3 --trust-remote-code
 ```
 
-- TRTLLM MLA (Optimized for Blackwell Architecture, e.g., B200)
+- TRTLLM MLA (Default for Blackwell MLA Models, e.g., B200)
 ```bash
 python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attention-backend trtllm_mla --trust-remote-code
 ```
