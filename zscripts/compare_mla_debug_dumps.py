@@ -71,10 +71,14 @@ def compare_step_tensors(step_dir1, step_dir2, step_num):
     """Compare all tensors for a given step between two backends."""
     tensor_files = [
         "hidden_states_at_entry.pt",  # Hidden states at entry
+        "q_after_layernorm.pt",  # Q after RMSNorm (LoRA path)
+        "q_input_b_proj.pt",     # Input to q_b_proj (LoRA path)
         "q_rope_pre.pt",  # Q before RoPE rotation (debug)
         "q_rope.pt",      # Q after RoPE rotation
         "q_nope_raw.pt",  # Q NoPE before BMM (debug)
         "q_nope.pt",      # Q NoPE after BMM
+        "q_lora_final.pt", # Q after q_b_proj (LoRA path)
+        "q_b_proj_weight.pt", # q_b_proj weight tensor
         "k_nope.pt", 
         "k_rope.pt", 
         "attn_out.pt"
@@ -103,10 +107,14 @@ def compare_step_tensors(step_dir1, step_dir2, step_num):
     # Tensor descriptions for better output
     tensor_descriptions = {
         "hidden_states_at_entry": "Hidden States at Entry",
+        "q_after_layernorm": "Q After Layernorm",
+        "q_input_b_proj": "Q Input B Proj",
         "q_rope_pre": "Q RoPE (pre-rotation)",
         "q_rope": "Q RoPE (post-rotation)", 
         "q_nope_raw": "Q NoPE (pre-BMM)",
         "q_nope": "Q NoPE (post-BMM)",
+        "q_lora_final": "Q LoRA Final",
+        "q_b_proj_weight": "Q B Proj Weight",
         "k_nope": "K NoPE",
         "k_rope": "K RoPE",
         "attn_out": "Attention Output"

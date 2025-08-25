@@ -110,7 +110,7 @@ def main() -> None:
     parser.add_argument(
         "--tokens",
         type=int,
-        default=10,
+        default=20,
         help="Number of tokens to generate (and steps to dump)",
     )
     parser.add_argument(
@@ -186,6 +186,9 @@ def main() -> None:
         extra_args=None,
         env_overrides=trt_env,
     )
+
+    # print the prompt
+    print(f"Prompt: {args.prompt}")
 
     try:
         print("Waiting for servers to be ready...")

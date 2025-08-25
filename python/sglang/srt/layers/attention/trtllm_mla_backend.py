@@ -51,6 +51,7 @@ class TRTLLMMLADecodeMetadata:
 
     workspace: Optional[torch.Tensor] = None
     block_kv_indices: Optional[torch.Tensor] = None
+    max_seq_len: Optional[int] = None
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -222,8 +223,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PAGED_SIZE=self.page_size,
         )
 
+        # Record the true maximum sequence length for this capture batch so that
+        # the kernel launch path (which requires an int not a tensor) can reuse
+        # it safely during both capture and replay.
+        max_seq_len_val = int(seq_lens.max().item())
+
         metadata = TRTLLMMLADecodeMetadata(
-            self.decode_cuda_graph_workspace, block_kv_indices
+            self.decode_cuda_graph_workspace,
+            block_kv_indices,
+            max_seq_len_val,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -268,6 +276,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PAGED_SIZE=self.page_size,
         )
 
+        # Update stored max_seq_len so subsequent kernel calls use the correct value
+        metadata.max_seq_len = int(seq_lens.max().item())
+
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
@@ -295,8 +306,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.seq_lens.device,
         )
 
+        # Precompute actual max(seq_lens) for this normal (non-graph) forward batch
+        max_seq_len_val = int(torch.max(forward_batch.seq_lens).item())
         self.forward_metadata = TRTLLMMLADecodeMetadata(
-            self.workspace_buffer, block_kv_indices
+            self.workspace_buffer, block_kv_indices, max_seq_len_val
         )
         forward_batch.decode_trtllm_mla_metadata = self.forward_metadata
 
@@ -461,6 +474,48 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         bmm1_scale = q_scale * k_scale * layer.scaling
 
+        """REMOVE"""
+        # Backend-specific debug (TRTLLM MLA): output-only post-kernel dump
+        import os
+        _dbg_enabled = os.getenv("SGLANG_MLA_DEBUG_TRTLLM", "0") == "1"
+        _dbg_steps = int(os.getenv("SGLANG_MLA_DEBUG_TRTLLM_STEPS", "10"))
+        _dbg_dir = os.getenv("SGLANG_MLA_DEBUG_TRTLLM_DIR", "divergence_debug")
+        _dbg_layer = int(os.getenv("SGLANG_MLA_DEBUG_TRTLLM_LAYER_ID", "-1"))
+        if _dbg_enabled and not hasattr(self, "_trtllm_debug_step"):
+            self._trtllm_debug_step = 0
+        # Pre-kernel dump (inputs)
+        if (
+            _dbg_enabled
+            and (_dbg_layer == -1 or layer.layer_id == _dbg_layer)
+            and self._trtllm_debug_step < _dbg_steps
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            if layer.layer_id == 0:
+                step_id = self._trtllm_debug_step + 1
+            else:
+                step_id = self._trtllm_debug_step
+            out_dir = os.path.join(_dbg_dir, f"step_{step_id}", f"layer_{layer.layer_id}")
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                # Save merged query input to TRT kernel
+                torch.save(query.detach().to("cpu"), os.path.join(out_dir, "query.pt"))
+                # Save separate q_nope and q_rope if available (FP16 path)
+                if merge_query and q_rope is not None:
+                    torch.save(
+                        q.view(-1, layer.tp_q_head_num, layer.v_head_dim).detach().to("cpu"),
+                        os.path.join(out_dir, "q_nope.pt"),
+                    )
+                    torch.save(
+                        q_rope.view(-1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim).detach().to("cpu"),
+                        os.path.join(out_dir, "q_rope.pt"),
+                    )
+                # Save kv cache buffer view
+                torch.save(kv_cache.detach().to("cpu"), os.path.join(out_dir, "kv_cache.pt"))
+            except Exception:
+                pass
+            self._trtllm_debug_step = step_id
+        """REMOVE"""
+        
         # Call TRT-LLM kernel
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
@@ -471,14 +526,36 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=metadata.block_kv_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
-            max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
+            max_seq_len=int(metadata.max_seq_len),
             bmm1_scale=bmm1_scale,
         )
 
-        # Extract value projection part and reshape
-        raw_out_v = raw_out[..., : layer.v_head_dim].contiguous()
-        output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        # Reshape output directly without slicing
+        output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+        """REMOVE"""
+        # Post-kernel dump (output only and metadata)
+        if (
+            _dbg_enabled
+            and (_dbg_layer == -1 or layer.layer_id == _dbg_layer)
+            and self._trtllm_debug_step < _dbg_steps
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            step_id = self._trtllm_debug_step
+            out_dir = os.path.join(_dbg_dir, f"step_{step_id}", f"layer_{layer.layer_id}")
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                torch.save(output.detach().to("cpu"), os.path.join(out_dir, "attn_out.pt"))
+                # save metadata
+                torch.save(metadata.workspace.detach().to("cpu"), os.path.join(out_dir, "metadata_workspace.pt"))
+                torch.save(metadata.block_kv_indices.detach().to("cpu"), os.path.join(out_dir, "metadata_block_kv_indices.pt"))
+                torch.save(metadata.max_seq_len, os.path.join(out_dir, "metadata_max_seq_len.pt"))
+                torch.save(bmm1_scale, os.path.join(out_dir, "metadata_bmm1_scale.pt"))
+            except Exception:
+                pass
+            self._trtllm_debug_step = step_id
+        """REMOVE"""
+        
         return output
 
 

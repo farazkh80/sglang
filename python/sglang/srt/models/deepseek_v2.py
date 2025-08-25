@@ -1208,20 +1208,20 @@ class DeepseekV2AttentionMLA(nn.Module):
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-        # dump hidden_states to sgl files similar 
-        _dbg_enabled = os.getenv("SGLANG_MLA_DEBUG", "0") == "1"
-        _dbg_layer = int(os.getenv("SGLANG_MLA_DEBUG_LAYER_ID", "0"))
-        _dbg_pre_ok = (
-            _dbg_enabled
-            and (_dbg_layer == -1 or self.layer_id == _dbg_layer)
-            and forward_batch.forward_mode.is_decode_or_idle()
-        )
+        # # dump hidden_states to sgl files similar 
+        # _dbg_enabled = os.getenv("SGLANG_MLA_DEBUG_DEEPSEEK", "0") == "1"
+        # _dbg_layer = int(os.getenv("SGLANG_MLA_DEBUG_DEEPSEEK_LAYER_ID", "0"))
+        # _dbg_pre_ok = (
+        #     _dbg_enabled
+        #     and (_dbg_layer == -1 or self.layer_id == _dbg_layer)
+        #     and forward_batch.forward_mode.is_decode_or_idle()
+        # )
         
-        if _dbg_pre_ok:
-            try:
-                self._dbg_hidden_states_at_entry = hidden_states.detach().to("cpu")
-            except Exception:
-                pass
+        # if _dbg_pre_ok:
+        #     try:
+        #         self._dbg_hidden_states_at_entry = hidden_states.detach().to("cpu")
+        #     except Exception:
+        #         pass
 
         if self.q_lora_rank is not None:
             if hidden_states.shape[0] <= 16 and self.use_min_latency_fused_a_gemm:
@@ -1247,8 +1247,31 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q = self.q_a_layernorm(q)
                 k_nope = self.kv_a_layernorm(k_nope)
 
+            # # Debug: capture q after layernorm (LoRA path)
+            # if _dbg_pre_ok:
+            #     try:
+            #         self._dbg_q_after_layernorm = q.detach().to("cpu")
+            #     except Exception:
+            #         pass
+
             k_nope = k_nope.unsqueeze(1)
+            # # Debug: capture input to q_b_proj (LoRA path)
+            # if _dbg_pre_ok:
+            #     try:
+            #         _dbg_q_input_b = q.detach().to("cpu")
+            #     except Exception:
+            #         _dbg_q_input_b = None
+
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+
+            # # Debug: capture q after q_b_proj (LoRA final)
+            # if _dbg_pre_ok:
+            #     try:
+            #         if _dbg_q_input_b is not None:
+            #             self._dbg_q_input_b_proj = _dbg_q_input_b
+            #         self._dbg_q_lora_final = q.detach().to("cpu")
+            #     except Exception:
+            #         pass
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -1260,21 +1283,21 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        # DEBUG add: capture raw q_nope and q_pe before ROPE and BMM transformations
-        _dbg_enabled = os.getenv("SGLANG_MLA_DEBUG", "0") == "1"
-        _dbg_layer = int(os.getenv("SGLANG_MLA_DEBUG_LAYER_ID", "0"))
-        _dbg_pre_ok = (
-            _dbg_enabled
-            and (_dbg_layer == -1 or self.layer_id == _dbg_layer)
-            and forward_batch.forward_mode.is_decode_or_idle()
-        )
-        if _dbg_pre_ok:
-            try:
-                # Store light CPU copies for later dump in core()
-                self._dbg_q_nope_raw = q_nope.detach().to("cpu")
-                self._dbg_q_rope_pre = q_pe.detach().to("cpu")
-            except Exception:
-                pass
+        # # DEBUG add: capture raw q_nope and q_pe before ROPE and BMM transformations
+        # _dbg_enabled = os.getenv("SGLANG_MLA_DEBUG_DEEPSEEK", "0") == "1"
+        # _dbg_layer = int(os.getenv("SGLANG_MLA_DEBUG_DEEPSEEK_LAYER_ID", "0"))
+        # _dbg_pre_ok = (
+        #     _dbg_enabled
+        #     and (_dbg_layer == -1 or self.layer_id == _dbg_layer)
+        #     and forward_batch.forward_mode.is_decode_or_idle()
+        # )
+        # if _dbg_pre_ok:
+        #     try:
+        #         # Store light CPU copies for later dump in core()
+        #         self._dbg_q_nope_raw = q_nope.detach().to("cpu")
+        #         self._dbg_q_rope_pre = q_pe.detach().to("cpu")
+        #     except Exception:
+        #         pass
 
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
@@ -1331,20 +1354,19 @@ class DeepseekV2AttentionMLA(nn.Module):
                     "is_neox": self.rotary_emb.is_neox_style,
                 }
 
-            # Debug dump at callsite (env-gated)
-            _dbg_enabled = os.getenv("SGLANG_MLA_DEBUG", "0") == "1"
-            _dbg_steps = int(os.getenv("SGLANG_MLA_DEBUG_STEPS", "10"))
-            _dbg_dir = os.getenv("SGLANG_MLA_DEBUG_DIR", "divergence_debug")
-            _dbg_layer = int(os.getenv("SGLANG_MLA_DEBUG_LAYER_ID", "0"))
-            _dbg_verbose = os.getenv("SGLANG_MLA_DEBUG_VERBOSE", "0") == "1"
+            # # Debug dump at callsite (env-gated)
+            # _dbg_enabled = os.getenv("SGLANG_MLA_DEBUG_DEEPSEEK", "0") == "1"
+            # _dbg_steps = int(os.getenv("SGLANG_MLA_DEBUG_DEEPSEEK_STEPS", "10"))
+            # _dbg_dir = os.getenv("SGLANG_MLA_DEBUG_DEEPSEEK_DIR", "divergence_debug")
+            # _dbg_layer = int(os.getenv("SGLANG_MLA_DEBUG_DEEPSEEK_LAYER_ID", "0"))
 
-            _do_dump = (
-                _dbg_enabled
-                and forward_batch.forward_mode.is_decode_or_idle()
-                and (_dbg_layer == -1 or self.layer_id == _dbg_layer)
-            )
-            if _do_dump and not hasattr(self, "_mla_debug_step"):
-                self._mla_debug_step = 0
+            # _do_dump = (
+            #     _dbg_enabled
+            #     and forward_batch.forward_mode.is_decode_or_idle()
+            #     and (_dbg_layer == -1 or self.layer_id == _dbg_layer)
+            # )
+            # if _do_dump and not hasattr(self, "_mla_debug_step"):
+            #     self._mla_debug_step = 0
 
             # Call attention
             attn_output = self.attn_mqa(
@@ -1357,60 +1379,71 @@ class DeepseekV2AttentionMLA(nn.Module):
                 **extra_args,
             )
 
-            # Dump tensors after attention for the selected layer/step
-            if _do_dump and self._mla_debug_step < _dbg_steps:
-                step_id = self._mla_debug_step + 1
-                backend_name = (
-                    self.current_attention_backend if hasattr(self, "current_attention_backend") else "unknown"
-                )
-                out_dir = os.path.join(_dbg_dir, backend_name, f"step_{step_id}")
-                try:
-                    if parallel_state.get_tensor_model_parallel_rank() == 0:
-                        if _dbg_verbose:
-                            print(
-                                f"[MLA DEBUG] preparing dump: backend={backend_name} layer={self.layer_id} step={step_id} dir={out_dir}",
-                                flush=True,
-                            )
-                        os.makedirs(out_dir, exist_ok=True)
-                    # inputs (post-BMM Q_nope_out and post-ROPE Q/K by default)
-                    torch.save(q_nope_out.detach().to("cpu"), os.path.join(out_dir, "q_nope.pt"))
-                    torch.save(q_pe.detach().to("cpu"), os.path.join(out_dir, "q_rope.pt"))
-                    torch.save(k_nope.detach().to("cpu"), os.path.join(out_dir, "k_nope.pt"))
-                    torch.save(k_pe.detach().to("cpu"), os.path.join(out_dir, "k_rope.pt"))
+            # # Dump tensors after attention for the selected layer/step
+            # if _do_dump and self._mla_debug_step < _dbg_steps:
+            #     step_id = self._mla_debug_step + 1
+            #     backend_name = (
+            #         self.current_attention_backend if hasattr(self, "current_attention_backend") else "unknown"
+            #     )
+            #     out_dir = os.path.join(_dbg_dir, backend_name, f"step_{step_id}")
+            #     try:
+            #         tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            #         tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            #         if tp_rank == 0:
+            #             os.makedirs(out_dir, exist_ok=True)
+            #             # inputs (post-BMM Q_nope_out and post-ROPE Q/K by default)
+            #             torch.save(q_nope_out.detach().to("cpu"), os.path.join(out_dir, "q_nope.pt"))
+            #             torch.save(q_pe.detach().to("cpu"), os.path.join(out_dir, "q_rope.pt"))
+            #             torch.save(k_nope.detach().to("cpu"), os.path.join(out_dir, "k_nope.pt"))
+            #             torch.save(k_pe.detach().to("cpu"), os.path.join(out_dir, "k_rope.pt"))
 
-                    # DEBUG add: also dump pre-ROPE Q and raw Q_nope (before BMM)
-                    if hasattr(self, "_dbg_hidden_states_at_entry"):
-                        torch.save(self._dbg_hidden_states_at_entry, os.path.join(out_dir, "hidden_states_at_entry.pt"))
-                    if hasattr(self, "_dbg_q_nope_raw"):
-                        torch.save(self._dbg_q_nope_raw, os.path.join(out_dir, "q_nope_raw.pt"))
-                    if hasattr(self, "_dbg_q_rope_pre"):
-                        torch.save(self._dbg_q_rope_pre, os.path.join(out_dir, "q_rope_pre.pt"))
+            #         # DEBUG add: also dump pre-ROPE Q and raw Q_nope (before BMM)
+            #         if hasattr(self, "_dbg_hidden_states_at_entry"):
+            #             torch.save(self._dbg_hidden_states_at_entry, os.path.join(out_dir, "hidden_states_at_entry.pt"))
+            #         if hasattr(self, "_dbg_q_nope_raw"):
+            #             torch.save(self._dbg_q_nope_raw, os.path.join(out_dir, "q_nope_raw.pt"))
+            #         if hasattr(self, "_dbg_q_rope_pre"):
+            #             torch.save(self._dbg_q_rope_pre, os.path.join(out_dir, "q_rope_pre.pt"))
+            #         # NEW DEBUG: dump q after layernorm, input to b proj, and final loRA q
+            #         if hasattr(self, "_dbg_q_after_layernorm"):
+            #             torch.save(self._dbg_q_after_layernorm, os.path.join(out_dir, "q_after_layernorm.pt"))
+            #         if hasattr(self, "_dbg_q_input_b_proj"):
+            #             torch.save(self._dbg_q_input_b_proj, os.path.join(out_dir, "q_input_b_proj.pt"))
+            #         if hasattr(self, "_dbg_q_lora_final"):
+            #             torch.save(self._dbg_q_lora_final, os.path.join(out_dir, "q_lora_final.pt"))
 
-                    # outputs
-                    torch.save(attn_output.detach().to("cpu"), os.path.join(out_dir, "attn_out.pt"))
-                    # meta
-                    meta = {
-                        "layer_id": self.layer_id,
-                        "seq_lens": forward_batch.seq_lens.detach().to("cpu"),
-                        "positions": (
-                            forward_batch.positions.detach().to("cpu")
-                            if getattr(forward_batch, "positions", None) is not None
-                            else None
-                        ),
-                        "num_heads": self.num_local_heads,
-                        "kv_lora_rank": self.kv_lora_rank,
-                        "qk_rope_head_dim": self.qk_rope_head_dim,
-                        "v_head_dim": self.v_head_dim,
-                    }
-                    torch.save(meta, os.path.join(out_dir, "meta.pt"))
-                    if _dbg_verbose:
-                        print(
-                            f"[MLA DEBUG] dump complete: backend={backend_name} layer={self.layer_id} step={step_id} dir={out_dir}",
-                            flush=True,
-                        )
-                except Exception:
-                    pass
-                self._mla_debug_step = step_id
+            #         # outputs
+            #         if tp_rank == 0:
+            #             torch.save(attn_output.detach().to("cpu"), os.path.join(out_dir, "attn_out.pt"))
+
+            #         # weights (dump q_b_proj weight to help diagnose LoRA projection differences)
+            #         try:
+            #             if tp_rank == 0 and hasattr(self, "q_b_proj") and hasattr(self.q_b_proj, "weight"):
+            #                 torch.save(self.q_b_proj.weight.detach().to("cpu"), os.path.join(out_dir, "q_b_proj_weight.pt"))
+            #         except Exception:
+            #             pass
+            #         # meta
+            #         meta = {
+            #             "layer_id": self.layer_id,
+            #             "seq_lens": forward_batch.seq_lens.detach().to("cpu"),
+            #             "positions": (
+            #                 forward_batch.positions.detach().to("cpu")
+            #                 if getattr(forward_batch, "positions", None) is not None
+            #                 else None
+            #             ),
+            #             "num_heads": self.num_local_heads,
+            #             "kv_lora_rank": self.kv_lora_rank,
+            #             "qk_rope_head_dim": self.qk_rope_head_dim,
+            #             "v_head_dim": self.v_head_dim,
+            #             "tp_rank": tp_rank,
+            #             "tp_size": tp_size,
+            #         }
+            #         if tp_rank == 0:
+            #             torch.save(meta, os.path.join(out_dir, "meta.pt"))
+
+            #     except Exception:
+            #         pass
+            #     self._mla_debug_step = step_id
         else:
             q = torch.cat([q_nope_out, q_pe], dim=-1)
             k = torch.cat([k_nope, k_pe], dim=-1)

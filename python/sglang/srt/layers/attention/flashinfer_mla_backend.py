@@ -585,6 +585,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
+        """REMOVE"""
+        # Backend-specific debug flags (FlashInfer MLA)
+        import os
+        _dbg_enabled = os.getenv("SGLANG_MLA_DEBUG_FLASHINFER", "0") == "1"
+        _dbg_steps = int(os.getenv("SGLANG_MLA_DEBUG_FLASHINFER_STEPS", "10"))
+        _dbg_dir = os.getenv("SGLANG_MLA_DEBUG_FLASHINFER_DIR", "divergence_debug")
+        _dbg_layer = int(os.getenv("SGLANG_MLA_DEBUG_FLASHINFER_LAYER_ID", "-1"))
+        if _dbg_enabled and not hasattr(self, "_fi_dbg_decode_step"):
+            self._fi_dbg_decode_step = 0
+        """REMOVE"""
+
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
 
@@ -622,6 +633,31 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
         k_buf = k_buf.view(-1, self.page_size, k_buf.shape[-1])
 
+        """REMOVE"""
+        if (
+            _dbg_enabled
+            and (_dbg_layer == -1 or layer.layer_id == _dbg_layer)
+            and self._fi_dbg_decode_step < _dbg_steps
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # Increment step counter only once per decode step (layer 0 acts as anchor)
+            if layer.layer_id == 0:
+                step_id = self._fi_dbg_decode_step + 1
+            else:
+                step_id = self._fi_dbg_decode_step
+
+            out_dir = os.path.join(
+                _dbg_dir, f"step_{step_id}", f"layer_{layer.layer_id}"
+            )
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                torch.save(q_nope.detach().to("cpu"), os.path.join(out_dir, "q_nope.pt"))
+                torch.save(q_rope.detach().to("cpu"), os.path.join(out_dir, "q_rope.pt"))
+                torch.save(k_buf.detach().to("cpu"), os.path.join(out_dir, "k_buf.pt"))
+            except Exception:
+                pass
+            self._fi_dbg_decode_step = step_id
+
         o = q_nope.new_empty(q_nope.shape)
         o = decode_wrapper.run(
             q_nope,
@@ -631,7 +667,26 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             out=o,
         )
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+        # ---------------------- DEBUG DUMP (post-kernel) ---------------------
+        if (
+            _dbg_enabled
+            and (_dbg_layer == -1 or layer.layer_id == _dbg_layer)
+            and self._fi_dbg_decode_step < _dbg_steps
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            step_id = self._fi_dbg_decode_step
+            out_dir = os.path.join(
+                _dbg_dir, f"step_{step_id}", f"layer_{layer.layer_id}"
+            )
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                torch.save(out.detach().to("cpu"), os.path.join(out_dir, "attn_out.pt"))
+            except Exception:
+                pass
+
+        return out
 
 
 class FlashInferMLAIndicesUpdaterDecode:
