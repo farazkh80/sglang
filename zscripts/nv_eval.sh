@@ -7,8 +7,8 @@ source nv_eval/bin/activate
 # # prepare the GPQA dataset (this is what's missing!)
 # python -m nemo_skills.dataset.prepare gpqa
 
-PORT=40000
-Backend=trtllm_mla
+PORT=30001
+Backend=trtllm_mla_full_cuda_graph_off_toms_server
 
 ns eval \
   --server_type=openai \

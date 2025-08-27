@@ -13,6 +13,5 @@ python3 -m sglang.launch_server \
   --chunked-prefill-size 8192 \
   --max-running-requests 1024 \
   --cuda-graph-max-bs 256 \
-  --disable-cuda-graph \
   --host 0.0.0.0 \
   --port 30001 

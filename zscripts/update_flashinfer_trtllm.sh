@@ -1,6 +1,6 @@
-pip install --no-deps --no-build-isolation "flashinfer_python @ git+https://github.com/cyx-6/flashinfer.git@48945059dfcf071c8878f1c0f2462ddea0155f81" --force-reinstall --no-cache-dir
+# pip install --no-deps --no-build-isolation "flashinfer_python @ git+https://github.com/cyx-6/flashinfer.git@48945059dfcf071c8878f1c0f2462ddea0155f81" --force-reinstall --no-cache-dir
 
-# pip install --no-deps --no-build-isolation "flashinfer_python==0.2.11.post1" --force-reinstall --no-cache-dir
+pip install --no-deps --no-build-isolation "flashinfer_python==v0.2.14" --force-reinstall --no-cache-dir
 
 # Verify installation
 echo "Verifying TRTLLM MLA kernel availability..."
