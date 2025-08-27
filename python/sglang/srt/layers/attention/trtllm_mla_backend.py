@@ -208,8 +208,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
         # Custom fast-path for decode/idle.
-        max_seqlen_pad = self._calc_padded_blocks(seq_lens.max().item())
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_seqlen_pad]
+        # Capture with full width so future longer sequences are safe during replay
+        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
 
         create_flashmla_kv_indices_triton[(bs,)](
             self.req_to_token,
@@ -218,7 +219,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             None,
             block_kv_indices,
             self.req_to_token.stride(0),
-            max_seqlen_pad,
+            max_blocks_per_seq,
             NUM_PAGE_PER_BLOCK=TRITON_PAD_NUM_PAGE_PER_BLOCK,
             PAGED_SIZE=self.page_size,
         )
@@ -450,6 +451,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Prepare KV cache inline
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        # Ensure contiguity for stable pointer usage (especially under CUDA graphs)
+        assert k_cache.is_contiguous(), "KV cache must be contiguous for TRTLLM MLA backend"
+        assert query.is_contiguous(), "Query must be contiguous for TRTLLM MLA backend"
         kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
         # Get metadata
@@ -473,49 +477,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         bmm1_scale = q_scale * k_scale * layer.scaling
-
-        """REMOVE"""
-        # Backend-specific debug (TRTLLM MLA): output-only post-kernel dump
-        import os
-        _dbg_enabled = os.getenv("SGLANG_MLA_DEBUG_TRTLLM", "0") == "1"
-        _dbg_steps = int(os.getenv("SGLANG_MLA_DEBUG_TRTLLM_STEPS", "10"))
-        _dbg_dir = os.getenv("SGLANG_MLA_DEBUG_TRTLLM_DIR", "divergence_debug")
-        _dbg_layer = int(os.getenv("SGLANG_MLA_DEBUG_TRTLLM_LAYER_ID", "-1"))
-        if _dbg_enabled and not hasattr(self, "_trtllm_debug_step"):
-            self._trtllm_debug_step = 0
-        # Pre-kernel dump (inputs)
-        if (
-            _dbg_enabled
-            and (_dbg_layer == -1 or layer.layer_id == _dbg_layer)
-            and self._trtllm_debug_step < _dbg_steps
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            if layer.layer_id == 0:
-                step_id = self._trtllm_debug_step + 1
-            else:
-                step_id = self._trtllm_debug_step
-            out_dir = os.path.join(_dbg_dir, f"step_{step_id}", f"layer_{layer.layer_id}")
-            try:
-                os.makedirs(out_dir, exist_ok=True)
-                # Save merged query input to TRT kernel
-                torch.save(query.detach().to("cpu"), os.path.join(out_dir, "query.pt"))
-                # Save separate q_nope and q_rope if available (FP16 path)
-                if merge_query and q_rope is not None:
-                    torch.save(
-                        q.view(-1, layer.tp_q_head_num, layer.v_head_dim).detach().to("cpu"),
-                        os.path.join(out_dir, "q_nope.pt"),
-                    )
-                    torch.save(
-                        q_rope.view(-1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim).detach().to("cpu"),
-                        os.path.join(out_dir, "q_rope.pt"),
-                    )
-                # Save kv cache buffer view
-                torch.save(kv_cache.detach().to("cpu"), os.path.join(out_dir, "kv_cache.pt"))
-            except Exception:
-                pass
-            self._trtllm_debug_step = step_id
-        """REMOVE"""
         
+        # Defensive: ensure captured block table is wide enough for current requirement
+        if metadata is not None and metadata.block_kv_indices is not None:
+            needed_blocks = self._calc_padded_blocks(int(metadata.max_seq_len))
+            assert (
+                metadata.block_kv_indices.shape[1] >= needed_blocks
+            ), "Captured block_kv_indices too narrow for current max_seq_len"
+
         # Call TRT-LLM kernel
         raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
@@ -532,29 +501,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Reshape output directly without slicing
         output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-        """REMOVE"""
-        # Post-kernel dump (output only and metadata)
-        if (
-            _dbg_enabled
-            and (_dbg_layer == -1 or layer.layer_id == _dbg_layer)
-            and self._trtllm_debug_step < _dbg_steps
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            step_id = self._trtllm_debug_step
-            out_dir = os.path.join(_dbg_dir, f"step_{step_id}", f"layer_{layer.layer_id}")
-            try:
-                os.makedirs(out_dir, exist_ok=True)
-                torch.save(output.detach().to("cpu"), os.path.join(out_dir, "attn_out.pt"))
-                # save metadata
-                torch.save(metadata.workspace.detach().to("cpu"), os.path.join(out_dir, "metadata_workspace.pt"))
-                torch.save(metadata.block_kv_indices.detach().to("cpu"), os.path.join(out_dir, "metadata_block_kv_indices.pt"))
-                torch.save(metadata.max_seq_len, os.path.join(out_dir, "metadata_max_seq_len.pt"))
-                torch.save(bmm1_scale, os.path.join(out_dir, "metadata_bmm1_scale.pt"))
-            except Exception:
-                pass
-            self._trtllm_debug_step = step_id
-        """REMOVE"""
         
         return output
 
